@@ -18,7 +18,6 @@ cloud_functions/functions/lib
 
 # misc
 .DS_Store
-.env*
 !.env.example
 !*.enc
 
@@ -32,3 +31,4 @@ firebase-debug.log*
 
 .vercel
 typedoc/
+config.bat

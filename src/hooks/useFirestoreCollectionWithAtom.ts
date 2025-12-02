@@ -16,14 +16,17 @@ import {
   setDoc,
   doc,
   deleteDoc,
+  updateDoc,
   deleteField,
   CollectionReference,
   Query,
-  QueryConstraint,
   WhereFilterOp,
   documentId,
   getCountFromServer,
   DocumentData,
+  or,
+  QueryFieldFilterConstraint,
+  Timestamp,
 } from "firebase/firestore";
 import { useErrorHandler } from "react-error-boundary";
 
@@ -66,6 +69,8 @@ interface IUseFirestoreCollectionWithAtomOptions<T> {
   nextPageAtom?: PrimitiveAtom<NextPageState>;
   /** Set this atom's value to the number of docs in the collection on each new snapshot */
   serverDocCountAtom?: PrimitiveAtom<number | undefined>;
+
+  joinOperator?: "AND" | "OR";
 }
 
 /**
@@ -100,6 +105,7 @@ export function useFirestoreCollectionWithAtom<
     deleteDocAtom,
     nextPageAtom,
     serverDocCountAtom,
+    joinOperator,
   } = options || {};
 
   const [firebaseDb] = useAtom(firebaseDbAtom, projectScope);
@@ -140,6 +146,7 @@ export function useFirestoreCollectionWithAtom<
       page,
       pageSize,
       filters,
+      joinOperator,
       sorts,
       onError
     ),
@@ -151,6 +158,9 @@ export function useFirestoreCollectionWithAtom<
         JSON.stringify(prev?.firestoreFilters)
       )
         return false;
+
+      // If joinOperator is not equal, update the query
+      if (next?.joinOperator !== prev?.joinOperator) return false;
 
       // If sorts are not equal, update the query
       // Overrides isLastPage check
@@ -255,17 +265,37 @@ export function useFirestoreCollectionWithAtom<
     // set the atom’s value to a function that updates a doc in the collection
     if (updateDocAtom) {
       setUpdateDocAtom(
-        () => (path: string, update: T, deleteFields?: string[]) => {
-          const updateToDb = { ...update };
+        () =>
+          async (
+            path: string,
+            update: T,
+            deleteFields?: string[],
+            options?: {
+              useSet?: boolean;
+            }
+          ) => {
+            const updateToDb = { ...update };
 
-          if (Array.isArray(deleteFields)) {
-            for (const field of deleteFields) {
-              set(updateToDb as any, field, deleteField());
+            if (Array.isArray(deleteFields)) {
+              for (const field of deleteFields) {
+                set(updateToDb as any, field, deleteField());
+              }
+            }
+
+            if (options?.useSet) {
+              return await setDoc(doc(firebaseDb, path), updateToDb, {
+                merge: true,
+              });
+            }
+
+            try {
+              return await updateDoc(doc(firebaseDb, path), updateToDb);
+            } catch (e) {
+              return await setDoc(doc(firebaseDb, path), updateToDb, {
+                merge: true,
+              });
             }
           }
-
-          return setDoc(doc(firebaseDb, path), updateToDb, { merge: true });
-        }
       );
     }
 
@@ -309,6 +339,7 @@ const getQuery = <T>(
   page: number,
   pageSize: number,
   filters: IUseFirestoreCollectionWithAtomOptions<T>["filters"],
+  joinOperator: "AND" | "OR" | undefined,
   sorts: IUseFirestoreCollectionWithAtomOptions<T>["sorts"],
   onError: IUseFirestoreCollectionWithAtomOptions<T>["onError"]
 ) => {
@@ -335,22 +366,60 @@ const getQuery = <T>(
     const limit = (page + 1) * pageSize;
     const firestoreFilters = tableFiltersToFirestoreFilters(filters || []);
 
-    return {
-      query: query<T>(
-        collectionRef,
-        queryLimit(limit),
-        ...firestoreFilters,
-        ...(sorts?.map((order) => orderBy(order.key, order.direction)) || [])
-      ),
-      page,
-      limit,
-      firestoreFilters,
-      sorts,
-      unlimitedQuery: query<T>(collectionRef, ...firestoreFilters),
-    };
+    return joinOperator === "OR"
+      ? {
+          query: query<T>(
+            collectionRef,
+            or(...firestoreFilters),
+            queryLimit(limit),
+            ...(sorts?.map((order) => orderBy(order.key, order.direction)) ||
+              [])
+          ),
+          page,
+          limit,
+          firestoreFilters,
+          sorts,
+          unlimitedQuery: query<T>(collectionRef, ...firestoreFilters),
+          joinOperator,
+        }
+      : {
+          query: query<T>(
+            collectionRef,
+            queryLimit(limit),
+            ...firestoreFilters,
+            ...(sorts?.map((order) => orderBy(order.key, order.direction)) ||
+              [])
+          ),
+          page,
+          limit,
+          firestoreFilters,
+          sorts,
+          unlimitedQuery: query<T>(collectionRef, ...firestoreFilters),
+          joinOperator,
+        };
   } catch (e) {
     if (onError) onError(e as FirestoreError);
     return null;
+  }
+};
+
+/**
+ * Parse datetime to Date object
+ * \{ nanoseconds: number; seconds: number \} is a Timestamp object without toDate() method, we need to calculate it manually
+ * */
+const parseDateFilterValue = (
+  date: Date | Timestamp | { nanoseconds: number; seconds: number }
+) => {
+  if (date instanceof Date) {
+    return date;
+  } else if ("toDate" in date) {
+    return date.toDate();
+  } else if (date.seconds) {
+    return new Date(date.seconds * 1000 + date.nanoseconds / 1_000_000);
+  } else if (date instanceof Timestamp) {
+    return date.toDate();
+  } else {
+    throw new Error(`Invalid date ${date}`);
   }
 };
 
@@ -361,13 +430,12 @@ const getQuery = <T>(
  * @returns Array of Firestore query `where` constraints
  */
 export const tableFiltersToFirestoreFilters = (filters: TableFilter[]) => {
-  const firestoreFilters: QueryConstraint[] = [];
+  const firestoreFilters: QueryFieldFilterConstraint[] = [];
 
   for (const filter of filters) {
     if (filter.operator.startsWith("date-")) {
       if (!filter.value) continue;
-      const filterDate =
-        "toDate" in filter.value ? filter.value.toDate() : filter.value;
+      const filterDate = parseDateFilterValue(filter.value);
       const [startDate, endDate] = getDateRange(filterDate);
 
       if (filter.operator === "date-equal") {
@@ -385,8 +453,7 @@ export const tableFiltersToFirestoreFilters = (filters: TableFilter[]) => {
       continue;
     } else if (filter.operator === "time-minute-equal") {
       if (!filter.value) continue;
-      const filterDate =
-        "toDate" in filter.value ? filter.value.toDate() : filter.value;
+      const filterDate = parseDateFilterValue(filter.value);
       const [startDate, endDate] = getTimeRange(filterDate);
 
       firestoreFilters.push(where(filter.key, ">=", startDate));
@@ -405,7 +472,21 @@ export const tableFiltersToFirestoreFilters = (filters: TableFilter[]) => {
         where(filter.key.concat(".hex"), "!=", filter.value.hex.toString())
       );
       continue;
+    } else if (filter.operator === "is-empty") {
+      firestoreFilters.push(where(filter.key, "==", ""));
+      continue;
+    } else if (filter.operator === "is-not-empty") {
+      firestoreFilters.push(where(filter.key, "!=", ""));
+      continue;
+    } else if (filter.operator === "array-contains") {
+      if (!filter.value || !filter.value.length) continue;
+      // make the value as a singular string
+      firestoreFilters.push(
+        where(filter.key, filter.operator as WhereFilterOp, filter.value[0])
+      );
+      continue;
     }
+
     firestoreFilters.push(
       where(filter.key, filter.operator as WhereFilterOp, filter.value)
     );

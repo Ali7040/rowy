@@ -22,7 +22,11 @@ import {
   _bulkWriteDbAtom,
 } from "./table";
 
-import { TableRow, BulkWriteFunction } from "@src/types/table";
+import {
+  TableRow,
+  BulkWriteFunction,
+  ArrayTableRowData,
+} from "@src/types/table";
 import {
   rowyUser,
   generateId,
@@ -211,7 +215,17 @@ export const addRowAtom = atom(
  */
 export const deleteRowAtom = atom(
   null,
-  async (get, set, path: string | string[]) => {
+  async (
+    get,
+    set,
+    {
+      path,
+      options,
+    }: {
+      path: string | string[];
+      options?: ArrayTableRowData;
+    }
+  ) => {
     const deleteRowDb = get(_deleteRowDbAtom);
     if (!deleteRowDb) throw new Error("Cannot write to database");
 
@@ -223,9 +237,9 @@ export const deleteRowAtom = atom(
         find(tableRowsLocal, ["_rowy_ref.path", path])
       );
       if (isLocalRow) set(tableRowsLocalAtom, { type: "delete", path });
-
       // Always delete from db in case it exists
-      await deleteRowDb(path);
+      // *options* are passed in case of array table to target specific row
+      await deleteRowDb(path, options);
       if (auditChange) auditChange("DELETE_ROW", path);
     };
 
@@ -242,10 +256,15 @@ export interface IBulkAddRowsOptions {
   rows: Partial<TableRow[]>;
   collection: string;
   onBatchCommit?: Parameters<BulkWriteFunction>[1];
+  type?: "add";
 }
 export const bulkAddRowsAtom = atom(
   null,
-  async (get, _, { rows, collection, onBatchCommit }: IBulkAddRowsOptions) => {
+  async (
+    get,
+    _,
+    { rows, collection, onBatchCommit, type }: IBulkAddRowsOptions
+  ) => {
     const bulkWriteDb = get(_bulkWriteDbAtom);
     if (!bulkWriteDb) throw new Error("Cannot write to database");
     const tableSettings = get(tableSettingsAtom);
@@ -277,7 +296,11 @@ export const bulkAddRowsAtom = atom(
 
     // Assign a random ID to each row
     const operations = rows.map((row) => ({
-      type: row?._rowy_ref?.id ? ("update" as "update") : ("add" as "add"),
+      type: type
+        ? type
+        : row?._rowy_ref?.id
+        ? ("update" as "update")
+        : ("add" as "add"),
       path: `${collection}/${row?._rowy_ref?.id ?? generateId()}`,
       data: { ...initialValues, ...omitRowyFields(row) },
     }));
@@ -312,6 +335,8 @@ export interface IUpdateFieldOptions {
   useArrayUnion?: boolean;
   /** Optionally, uses firestore's arrayRemove with the given value. Removes given value items from the existing array */
   useArrayRemove?: boolean;
+  /** Optionally, used to locate the row in ArraySubTable. */
+  arrayTableData?: ArrayTableRowData;
 }
 /**
  * Set function updates or deletes a field in a row.
@@ -339,6 +364,7 @@ export const updateFieldAtom = atom(
       disableCheckEquality,
       useArrayUnion,
       useArrayRemove,
+      arrayTableData,
     }: IUpdateFieldOptions
   ) => {
     const updateRowDb = get(_updateRowDbAtom);
@@ -352,7 +378,13 @@ export const updateFieldAtom = atom(
     const tableRows = get(tableRowsAtom);
     const tableRowsLocal = get(tableRowsLocalAtom);
 
-    const row = find(tableRows, ["_rowy_ref.path", path]);
+    const row = find(
+      tableRows,
+      arrayTableData?.index !== undefined
+        ? ["_rowy_ref.arrayTableData.index", arrayTableData?.index]
+        : ["_rowy_ref.path", path]
+    );
+
     if (!row) throw new Error("Could not find row");
     const isLocalRow = Boolean(find(tableRowsLocal, ["_rowy_ref.path", path]));
 
@@ -387,7 +419,12 @@ export const updateFieldAtom = atom(
         ...(row[fieldName] ?? []),
         ...localUpdate[fieldName],
       ];
-      dbUpdate[fieldName] = arrayUnion(...dbUpdate[fieldName]);
+      // if we are updating a row of ArraySubTable
+      if (arrayTableData?.index !== undefined) {
+        dbUpdate[fieldName] = localUpdate[fieldName];
+      } else {
+        dbUpdate[fieldName] = arrayUnion(...dbUpdate[fieldName]);
+      }
     }
 
     //apply arrayRemove
@@ -400,8 +437,15 @@ export const updateFieldAtom = atom(
         row[fieldName] ?? [],
         (el) => !find(localUpdate[fieldName], el)
       );
-      dbUpdate[fieldName] = arrayRemove(...dbUpdate[fieldName]);
+
+      // if we are updating a row of ArraySubTable
+      if (arrayTableData?.index !== undefined) {
+        dbUpdate[fieldName] = localUpdate[fieldName];
+      } else {
+        dbUpdate[fieldName] = arrayRemove(...dbUpdate[fieldName]);
+      }
     }
+    // need to pass the index of the row to updateRowDb
 
     // Check for required fields
     const newRowValues = updateRowData(cloneDeep(row), dbUpdate);
@@ -431,7 +475,12 @@ export const updateFieldAtom = atom(
         await updateRowDb(
           row._rowy_ref.path,
           omitRowyFields(newRowValues),
-          deleteField ? [fieldName] : []
+          deleteField ? [fieldName] : [],
+          {
+            ...arrayTableData,
+            // using set if we are updating a nested field
+            useSet: fieldName.split(".").length > 1,
+          }
         );
       }
     }
@@ -440,7 +489,12 @@ export const updateFieldAtom = atom(
       await updateRowDb(
         row._rowy_ref.path,
         omitRowyFields(dbUpdate),
-        deleteField ? [fieldName] : []
+        deleteField ? [fieldName] : [],
+        {
+          ...arrayTableData,
+          // using set if we are updating a nested field
+          useSet: fieldName.split(".").length > 1,
+        }
       );
     }
 

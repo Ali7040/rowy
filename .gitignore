@@ -31,4 +31,8 @@ firebase-debug.log*
 
 .vercel
 typedoc/
-config.bat
+
+# env files (restored after malware removed this)
+.env
+.env.*
+!.env.example
